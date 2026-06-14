@@ -6,6 +6,7 @@ Ce service expose des endpoints REST pour:
 
 - recuperer les informations du wallet/noeud,
 - consulter les balances on-chain et Lightning,
+- lister les canaux ouverts et leur liquidite par canal,
 - creer et lister des factures Lightning,
 - payer une facture BOLT11,
 - signer et verifier des messages.
@@ -183,7 +184,68 @@ curl -X GET http://localhost:5003/api/getinfo
 curl -X GET http://localhost:5003/api/balance
 ```
 
-### 3) Creer une facture Lightning
+> **Difference avec `/channels`**: `/balance` renvoie un total agrege (`offChainBalance`). `/channels` detaille chaque canal ouvert avec sa liquidite sortante et entrante.
+
+### 3) Lister les canaux et la liquidite
+
+- **Method**: `GET`
+- **Route**: `/api/nodes/:nodeId/channels` ou `/api/channels` (legacy)
+- **Body**: aucun
+- **Description**: retourne tous les canaux Lightning ouverts du noeud, avec la capacite de liquidite par canal (via `ln-service` / `getChannels`).
+- **Exemple curl**:
+
+```bash
+curl -X GET http://localhost:5003/api/nodes/alice/channels
+```
+
+Legacy (premier noeud configure):
+
+```bash
+curl -X GET http://localhost:5003/api/channels
+```
+
+- **Reponse (JSON)** — structure typique:
+
+```json
+{
+  "nodeId": "alice",
+  "count": 1,
+  "channels": [
+    {
+      "channel_id": "...",
+      "partner": "02...",
+      "capacity": 1000000,
+      "outbound_capacity": 500000,
+      "inbound_capacity": 500000,
+      "unsettled_balance": 0,
+      "sent": 0,
+      "received": 0,
+      "is_active": true,
+      "is_private": false,
+      "is_closing": false,
+      "is_opening": false,
+      "transaction_id": "...",
+      "transaction_vout": 0
+    }
+  ]
+}
+```
+
+- **Champs utiles pour la liquidite**:
+
+| Champ | Signification |
+|-------|---------------|
+| `outbound_capacity` | Liquidite sortante (satoshis que vous pouvez envoyer) |
+| `inbound_capacity` | Liquidite entrante (satoshis que vous pouvez recevoir) |
+| `capacity` | Taille totale du canal |
+| `unsettled_balance` | Montant en vol (HTLC non regles) |
+| `is_active` | Canal utilisable pour le routage |
+| `partner` | Cle publique du noeud pair |
+
+- Un canal est **bidirectionnel** (liquidite utilisable dans les deux sens) lorsque `outbound_capacity > 0` **et** `inbound_capacity > 0`.
+- Si `count` vaut `0`, le noeud n'a pas encore de canal ouvert (ouvrez-en un dans Polar, puis minez un bloc).
+
+### 4) Creer une facture Lightning
 
 - **Method**: `POST`
 - **Route**: `/api/nodes/:nodeId/invoice` ou `/api/invoice` (legacy)
@@ -207,7 +269,7 @@ curl -X POST http://localhost:5003/api/invoice \
   -d '{"sats":1000,"description":"Paiement test"}'
 ```
 
-### 4) Lister les factures
+### 5) Lister les factures
 
 - **Method**: `GET`
 - **Route**: `/api/nodes/:nodeId/invoices` ou `/api/invoices` (legacy)
@@ -218,7 +280,7 @@ curl -X POST http://localhost:5003/api/invoice \
 curl -X GET http://localhost:5003/api/invoices
 ```
 
-### 5) Payer une facture BOLT11
+### 6) Payer une facture BOLT11
 
 - **Method**: `POST`
 - **Route**: `/api/nodes/:nodeId/pay` ou `/api/pay` (legacy)
@@ -240,7 +302,7 @@ curl -X POST http://localhost:5003/api/pay \
   -d '{"request":"lnbc1..."}'
 ```
 
-### 6) Signer un message
+### 7) Signer un message
 
 - **Method**: `POST`
 - **Route**: `/api/nodes/:nodeId/signmessage` ou `/api/signmessage` (legacy)
@@ -261,7 +323,7 @@ curl -X POST http://localhost:5003/api/signmessage \
   -d '{"message":"Hello, LND!"}'
 ```
 
-### 7) Verifier un message signe
+### 8) Verifier un message signe
 
 - **Method**: `POST`
 - **Route**: `/api/nodes/:nodeId/verifymessage` ou `/api/verifymessage` (legacy)
@@ -290,6 +352,7 @@ curl -X POST http://localhost:5003/api/verifymessage \
 - `404 Unknown LND node`: l'identifiant `:nodeId` ne correspond a aucun noeud connecte (consultez `GET /api/nodes`).
 - `503 LND service is unavailable`: la connexion LND n'est pas etablie (variables `.env` invalides ou noeud injoignable).
 - `400` sur les routes `POST`: payload JSON manquant ou invalide.
+- `500 Failed to get channels`: erreur LND lors de l'appel `getChannels` (macaroon, certificat, ou noeud injoignable).
 - `500`: erreur interne renvoyee par LND ou par le serveur.
 
 ## Scripts npm
