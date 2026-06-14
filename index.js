@@ -1,114 +1,159 @@
 // index.js
 
-// --- 1. DEPENDENCIES AND INITIALIZATION ---
 const express = require('express');
-// The ln-service package provides higher-level functions and also exports authenticatedLndGrpc
 const { authenticatedLndGrpc } = require('ln-service');
+const {
+    getWalletInfo,
+    getChainBalance,
+    getChannelBalance,
+    createInvoice,
+    getInvoices,
+    pay,
+    signMessage,
+    verifyMessage,
+} = require('ln-service');
 const dotenv = require('dotenv');
 const cors = require('cors');
 
-// Load environment variables from a .env file
 dotenv.config();
 
-// Create an Express application
 const app = express();
+const MAX_NODES = 3;
 
-// --- 2. MIDDLEWARE CONFIGURATION ---
+/** @type {Map<string, { lnd: object, socket: string }>} */
+const lndNodes = new Map();
+
 app.use(cors());
 app.use(express.json());
 
-// --- 3. LND CONNECTION SETUP ---
-let lnd; // This will hold our authenticated LND gRPC client
+function getNodeEnv(index, legacy = false) {
+    if (legacy) {
+        return {
+            id: process.env.LND_NODE_ID_1 || process.env.LND_NODE_ID || '1',
+            socket: process.env.LND_GRPC_HOST,
+            macaroon: process.env.LND_MACAROON_BASE64,
+            cert: process.env.LND_TLS_CERT_BASE64,
+        };
+    }
 
-/**
- * Connects to the LND node using credentials from the .env file.
- * ln-service, like the lightning package, requires base64 encoded credentials.
- */
-function connectToLnd() {
-    try {
-        // Retrieve LND connection details from environment variables
-        const socket = process.env.LND_GRPC_HOST;
-        const macaroon = process.env.LND_MACAROON_BASE64;
-        const cert = process.env.LND_TLS_CERT_BASE64;
+    return {
+        id: process.env[`LND_NODE_ID_${index}`] || String(index),
+        socket: process.env[`LND_GRPC_HOST_${index}`],
+        macaroon: process.env[`LND_MACAROON_BASE64_${index}`],
+        cert: process.env[`LND_TLS_CERT_BASE64_${index}`],
+    };
+}
 
-        // --- Input Validation ---
+function loadNodeConfigs() {
+    const configs = [];
+    const seenIds = new Set();
+
+    const hasNumberedNode1 = Boolean(process.env.LND_GRPC_HOST_1);
+    if (!hasNumberedNode1 && process.env.LND_GRPC_HOST) {
+        configs.push(getNodeEnv(1, true));
+    }
+
+    for (let index = 1; index <= MAX_NODES; index += 1) {
+        const { id, socket, macaroon, cert } = getNodeEnv(index);
+        const hasAny = Boolean(socket || macaroon || cert);
+        if (!hasAny) {
+            continue;
+        }
+
         if (!socket || !macaroon || !cert) {
-            console.error('LND connection details are missing in the .env file.');
-            console.error('Please provide LND_GRPC_HOST, LND_MACAROON_BASE64, and LND_TLS_CERT_BASE64.');
+            console.error(`Incomplete LND config for node slot ${index}.`);
+            console.error(`Provide LND_GRPC_HOST_${index}, LND_MACAROON_BASE64_${index}, and LND_TLS_CERT_BASE64_${index}.`);
             process.exit(1);
         }
 
-        // The authenticatedLndGrpc function returns the authenticated LND object
-        const { lnd: authenticatedLnd } = authenticatedLndGrpc({
-            socket,
-            macaroon,
-            cert,
-        });
-        
-        lnd = authenticatedLnd;
-        console.log('Successfully authenticated with LND node via ln-service!');
+        if (seenIds.has(id)) {
+            console.error(`Duplicate LND node id "${id}". Each node must have a unique LND_NODE_ID_N value.`);
+            process.exit(1);
+        }
 
-    } catch (error) {
-        console.error('Failed to connect to LND:', error.message);
+        seenIds.add(id);
+        configs.push({ id, socket, macaroon, cert });
+    }
+
+    if (configs.length === 0) {
+        console.error('No LND nodes configured.');
+        console.error('Provide node 1 credentials via LND_GRPC_HOST / LND_MACAROON_BASE64 / LND_TLS_CERT_BASE64');
+        console.error('or via LND_GRPC_HOST_1 / LND_MACAROON_BASE64_1 / LND_TLS_CERT_BASE64_1 (up to 3 nodes).');
         process.exit(1);
+    }
+
+    if (configs.length > MAX_NODES) {
+        console.error(`At most ${MAX_NODES} LND nodes are supported.`);
+        process.exit(1);
+    }
+
+    return configs;
+}
+
+function connectToLndNodes() {
+    const configs = loadNodeConfigs();
+
+    for (const config of configs) {
+        try {
+            const { lnd } = authenticatedLndGrpc({
+                socket: config.socket,
+                macaroon: config.macaroon,
+                cert: config.cert,
+            });
+
+            lndNodes.set(config.id, { lnd, socket: config.socket });
+            console.log(`Connected to LND node "${config.id}" at ${config.socket}`);
+        } catch (error) {
+            console.error(`Failed to connect to LND node "${config.id}":`, error.message);
+            process.exit(1);
+        }
     }
 }
 
-// --- 4. API ENDPOINTS / ROUTES ---
-
-// Middleware to check if the LND connection is established
-const checkLndConnection = (req, res, next) => {
-    if (!lnd) {
-        return res.status(503).json({ error: 'LND service is unavailable. Check server logs.' });
+const resolveLndNode = (req, res, next) => {
+    const node = lndNodes.get(req.params.nodeId);
+    if (!node) {
+        return res.status(404).json({
+            error: `Unknown LND node "${req.params.nodeId}".`,
+            availableNodes: [...lndNodes.keys()],
+        });
     }
-    // Pass the lnd object in the request for easy access in routes
-    req.lnd = lnd; 
+
+    req.lnd = node.lnd;
+    req.nodeId = req.params.nodeId;
     next();
 };
 
-app.use(checkLndConnection);
+const attachDefaultLnd = (req, res, next) => {
+    const defaultNodeId = [...lndNodes.keys()][0];
+    const node = lndNodes.get(defaultNodeId);
+    req.lnd = node.lnd;
+    req.nodeId = defaultNodeId;
+    next();
+};
 
-// We need to import the methods we'll use from ln-service
-const { getWalletInfo, getChainBalance, getChannelBalance, createInvoice, getInvoices, pay, signMessage , verifyMessage, createHodlInvoice, createWallet } = require('ln-service');
-
-/**
- * @route   GET /api/getinfo
- * @desc    Get general information about the LND node.
- */
-app.get('/api/getinfo', async (req, res) => {
+async function handleGetInfo(req, res) {
     try {
         const info = await getWalletInfo({ lnd: req.lnd });
         res.json(info);
     } catch (error) {
-        console.error('Error getting node info:', error);
+        console.error(`[${req.nodeId}] Error getting node info:`, error);
         res.status(500).json({ error: 'Failed to get node info.', details: error });
     }
-});
+}
 
-/**
- * @route   GET /api/balance
- * @desc    Get the on-chain and off-chain (channel) balances.
- */
-app.get('/api/balance', async (req, res) => {
+async function handleGetBalance(req, res) {
     try {
         const onChainBalance = await getChainBalance({ lnd: req.lnd });
         const offChainBalance = await getChannelBalance({ lnd: req.lnd });
-        res.json({
-            onChainBalance,
-            offChainBalance,
-        });
+        res.json({ onChainBalance, offChainBalance });
     } catch (error) {
-        console.error('Error getting balance:', error);
+        console.error(`[${req.nodeId}] Error getting balance:`, error);
         res.status(500).json({ error: 'Failed to get balance.', details: error });
     }
-});
+}
 
-/**
- * @route   POST /api/invoice
- * @desc    Create a new Lightning invoice.
- * @body    { sats: number, description: string }
- */
-app.post('/api/invoice', async (req, res) => {
+async function handleCreateInvoice(req, res) {
     try {
         const { sats, description } = req.body;
 
@@ -124,85 +169,57 @@ app.post('/api/invoice', async (req, res) => {
 
         res.json(invoice);
     } catch (error) {
-        console.error('Error creating invoice:', error);
+        console.error(`[${req.nodeId}] Error creating invoice:`, error);
         res.status(500).json({ error: 'Failed to create invoice.', details: error });
     }
-});
+}
 
-/**
- * @route   GET /api/invoices
- * @desc    List all invoices.
- */
-app.get('/api/invoices', async (req, res) => {
+async function handleListInvoices(req, res) {
     try {
         const { invoices } = await getInvoices({ lnd: req.lnd });
         res.json(invoices);
     } catch (error) {
-        console.error('Error listing invoices:', error);
+        console.error(`[${req.nodeId}] Error listing invoices:`, error);
         res.status(500).json({ error: 'Failed to list invoices.', details: error });
     }
-});
+}
 
-/**
- * @route   POST /api/pay
- * @desc    Pay a Lightning invoice (payment request string).
- * @body    { request: string }
- */
-app.post('/api/pay', async (req, res) => {
+async function handlePay(req, res) {
     try {
         const { request } = req.body;
 
         if (!request) {
             return res.status(400).json({ error: 'A `request` string (BOLT11 invoice) is required.' });
         }
-        
+
         const paymentResult = await pay({ lnd: req.lnd, request });
-
         res.json({ success: true, payment_info: paymentResult });
-
     } catch (error) {
-        console.error('Error paying invoice:', error);
+        console.error(`[${req.nodeId}] Error paying invoice:`, error);
         res.status(500).json({ error: 'Failed to pay invoice.', details: error });
     }
-});
+}
 
-
-/**
- * @route POST /api/signmessage
- * @desc Sign a message with the LND node's private key.
- * @body { message: string }
- * 
- */
-
-    app.post('/api/signmessage', async (req, res) => {
-
-        try {
-            const { message } = req.body;
-            if (!message || typeof message !== 'string') {
-                return res.status(400).json({ error: 'A `message` string is required.' });
-            }
-
-            // Use the ln-service's signMessage function
-            const { signature } = await signMessage({
-                lnd: req.lnd,
-                message: Buffer.from(message, 'utf8'),
-            });
-
-            res.json({ message, signature });
-        } catch (error) {
-            console.error('Error signing message:', error);
-            res.status(500).json({ error: 'Failed to sign message.', details: error });
+async function handleSignMessage(req, res) {
+    try {
+        const { message } = req.body;
+        if (!message || typeof message !== 'string') {
+            return res.status(400).json({ error: 'A `message` string is required.' });
         }
-    })
 
-/**
- * @route POST /api/verifymessage
- * @desc Verify a signed message with the LND node's public key.
- * @body { message: string, signature: string, pubkey: string }
- * 
- */
+        const { signature } = await signMessage({
+            lnd: req.lnd,
+            message: Buffer.from(message, 'utf8'),
+        });
 
-app.post('/api/verifymessage', async (req, res) => {
+        res.json({ message, signature });
+    } catch (error) {
+        console.error(`[${req.nodeId}] Error signing message:`, error);
+        res.status(500).json({ error: 'Failed to sign message.', details: error });
+    }
+}
+
+async function handleVerifyMessage(req, res) {
     try {
         const { message, signature, pubkey } = req.body;
 
@@ -217,32 +234,71 @@ app.post('/api/verifymessage', async (req, res) => {
             public_key: pubkey,
         });
 
-        return res.json({ isValid });
-
-
+        res.json({ isValid });
     } catch (error) {
-
-        console.error('Error verifying message:', error);
+        console.error(`[${req.nodeId}] Error verifying message:`, error);
         res.status(500).json({ error: 'Failed to verify message.', details: error });
-        
     }
-})
+}
 
-// --- 5. SERVER STARTUP ---
+function registerNodeRoutes(middleware) {
+    app.get('/api/nodes/:nodeId/getinfo', middleware, handleGetInfo);
+    app.get('/api/nodes/:nodeId/balance', middleware, handleGetBalance);
+    app.get('/api/nodes/:nodeId/invoices', middleware, handleListInvoices);
+    app.post('/api/nodes/:nodeId/invoice', middleware, handleCreateInvoice);
+    app.post('/api/nodes/:nodeId/pay', middleware, handlePay);
+    app.post('/api/nodes/:nodeId/signmessage', middleware, handleSignMessage);
+    app.post('/api/nodes/:nodeId/verifymessage', middleware, handleVerifyMessage);
+}
+
+app.get('/api/nodes', (req, res) => {
+    res.json({
+        maxNodes: MAX_NODES,
+        connectedNodes: [...lndNodes.entries()].map(([id, node]) => ({
+            id,
+            grpcHost: node.socket,
+        })),
+    });
+});
+
+registerNodeRoutes(resolveLndNode);
+
+// Legacy routes (first configured node) for backward compatibility
+app.get('/api/getinfo', attachDefaultLnd, handleGetInfo);
+app.get('/api/balance', attachDefaultLnd, handleGetBalance);
+app.get('/api/invoices', attachDefaultLnd, handleListInvoices);
+app.post('/api/invoice', attachDefaultLnd, handleCreateInvoice);
+app.post('/api/pay', attachDefaultLnd, handlePay);
+app.post('/api/signmessage', attachDefaultLnd, handleSignMessage);
+app.post('/api/verifymessage', attachDefaultLnd, handleVerifyMessage);
+
 const PORT = process.env.PORT || 5003;
 
-connectToLnd();
+connectToLndNodes();
 
 app.listen(PORT, () => {
-    console.log(`API Server using 'ln-service' package is running on http://localhost:${PORT}`);
+    const nodeIds = [...lndNodes.keys()];
+
+    console.log(`API Server using 'ln-service' is running on http://localhost:${PORT}`);
+    console.log(`Connected nodes (${nodeIds.length}/${MAX_NODES}): ${nodeIds.join(', ')}`);
     console.log('----------------------------------------------------');
-    console.log('Available Endpoints:');
-    console.log(`- GET    /api/getinfo`);
-    console.log(`- GET    /api/balance`);
-    console.log(`- GET    /api/invoices`);
-    console.log(`- POST   /api/invoice  (Body: { "sats": 1000, "description": "Test" })`);
-    console.log(`- POST   /api/pay      (Body: { "request": "lnbc..." })`);
-    console.log(`- POST   /api/signmessage (Body: { "message": "Hello, LND!" })`);
-    console.log(`- POST   /api/verifymessage (Body: { "message": "Hello, LND!", "signature": "...", "pubkey": "..." })`);
+    console.log('Discovery:');
+    console.log('- GET    /api/nodes');
+    console.log('Node-scoped endpoints (replace :nodeId with one of the ids above):');
+    console.log('- GET    /api/nodes/:nodeId/getinfo');
+    console.log('- GET    /api/nodes/:nodeId/balance');
+    console.log('- GET    /api/nodes/:nodeId/invoices');
+    console.log('- POST   /api/nodes/:nodeId/invoice');
+    console.log('- POST   /api/nodes/:nodeId/pay');
+    console.log('- POST   /api/nodes/:nodeId/signmessage');
+    console.log('- POST   /api/nodes/:nodeId/verifymessage');
+    console.log('Legacy endpoints (first configured node only):');
+    console.log('- GET    /api/getinfo');
+    console.log('- GET    /api/balance');
+    console.log('- GET    /api/invoices');
+    console.log('- POST   /api/invoice');
+    console.log('- POST   /api/pay');
+    console.log('- POST   /api/signmessage');
+    console.log('- POST   /api/verifymessage');
     console.log('----------------------------------------------------');
 });
