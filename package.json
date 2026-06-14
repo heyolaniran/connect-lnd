@@ -25,5 +25,9 @@
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
+  },
+  "allowScripts": {
+    "fsevents@2.3.3": true,
+    "protobufjs@7.5.3": true
   }
 }

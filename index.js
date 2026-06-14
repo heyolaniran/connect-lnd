@@ -6,6 +6,7 @@ const {
     getWalletInfo,
     getChainBalance,
     getChannelBalance,
+    getChannels,
     createInvoice,
     getInvoices,
     pay,
@@ -153,6 +154,38 @@ async function handleGetBalance(req, res) {
     }
 }
 
+async function handleGetChannels(req, res) {
+    try {
+        const {channels} = await getChannels({lnd: req.lnd});
+
+        const liquidity = channels.map((ch) => ({
+            channel_id: ch.id,
+            partner: ch.partner_public_key,
+            capacity: ch.capacity,
+            outbound_capacity: ch.local_balance,
+            inbound_capacity: ch.remote_balance,
+            unsettled_balance: ch.unsettled_balance,
+            sent: ch.sent,
+            received: ch.received,
+            is_active: ch.is_active,
+            is_private: ch.is_private,
+            is_closing: ch.is_closing,
+            is_opening: ch.is_opening,
+            transaction_id : ch.transaction_id,
+            transaction_vout: ch.transaction_vout,
+        }))
+
+        res.json({
+            nodeId: req.nodeId,
+            count: liquidity.length,
+            channels: liquidity,
+        })
+    } catch (error) {
+        console.error(`[${req.nodeId}] Error getting channels:`, error);
+        res.status(500).json({ error: 'Failed to get channels.', details: error });
+    }
+}
+
 async function handleCreateInvoice(req, res) {
     try {
         const { sats, description } = req.body;
@@ -244,6 +277,7 @@ async function handleVerifyMessage(req, res) {
 function registerNodeRoutes(middleware) {
     app.get('/api/nodes/:nodeId/getinfo', middleware, handleGetInfo);
     app.get('/api/nodes/:nodeId/balance', middleware, handleGetBalance);
+    app.get('/api/nodes/:nodeId/channels', middleware, handleGetChannels);
     app.get('/api/nodes/:nodeId/invoices', middleware, handleListInvoices);
     app.post('/api/nodes/:nodeId/invoice', middleware, handleCreateInvoice);
     app.post('/api/nodes/:nodeId/pay', middleware, handlePay);
@@ -267,6 +301,7 @@ registerNodeRoutes(resolveLndNode);
 app.get('/api/getinfo', attachDefaultLnd, handleGetInfo);
 app.get('/api/balance', attachDefaultLnd, handleGetBalance);
 app.get('/api/invoices', attachDefaultLnd, handleListInvoices);
+app.get('/api/channels', attachDefaultLnd, handleGetChannels);
 app.post('/api/invoice', attachDefaultLnd, handleCreateInvoice);
 app.post('/api/pay', attachDefaultLnd, handlePay);
 app.post('/api/signmessage', attachDefaultLnd, handleSignMessage);
