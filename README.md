@@ -15,8 +15,9 @@ Ce service expose des endpoints REST pour:
 
 Le serveur:
 
-- initialise une connexion gRPC authentifiee vers LND au demarrage,
-- applique un middleware global qui bloque les requetes si LND est indisponible,
+- initialise une connexion gRPC authentifiee vers LND au demarrage (et verifie que chaque noeud repond),
+- traduit les erreurs `ln-service` (`[status, message]`) en codes HTTP (`400`, `404`, `503`, ...),
+- protege optionnellement les routes `/api` par cle API (`API_KEY`),
 - expose des routes REST sous le prefixe `/api`,
 - renvoie des reponses JSON utilisables depuis Postman, curl, ou un frontend.
 
@@ -30,7 +31,7 @@ Stack principale:
 
 ## Prerequis
 
-- Node.js 14+ (Node.js 18+ recommande)
+- Node.js 22+ (requis par `ln-service` 61+)
 - Un noeud LND actif et accessible en gRPC
 - Les credentials LND:
   - hote/port gRPC (`host:port`, ex: `127.0.0.1:10009`)
@@ -89,6 +90,19 @@ LND_TLS_CERT_BASE64_3=<tls_carol_base64>
 - `LND_NODE_ID_N` est optionnel (defaut: `"1"`, `"2"`, `"3"`) et sert d'identifiant dans les URLs (`/api/nodes/alice/...`).
 - Les slots 2 et 3 sont optionnels; seuls les noeuds completement configures sont demarres.
 - Si `LND_GRPC_HOST_1` est defini, la config legacy (`LND_GRPC_HOST` sans suffixe) est ignoree pour le slot 1.
+- Les identifiants de noeuds doivent etre uniques (le serveur refuse de demarrer en cas de doublon).
+
+### Optionnel — securite
+
+```env
+# Exige `x-api-key: <valeur>` ou `Authorization: Bearer <valeur>` sur /api
+API_KEY=change-me
+
+# Restreint CORS a une liste d'origines (defaut: toutes)
+CORS_ORIGIN=http://localhost:3000,https://my-frontend.example
+```
+
+Sans `API_KEY`, les routes `/api` sont ouvertes: a reserver au developpement local, car elles permettent de payer des factures et de signer des messages.
 
 ### Comment obtenir les valeurs base64
 
@@ -146,15 +160,28 @@ Par defaut:
 
 Toutes les reponses sont en JSON.
 
+### Health check
+
+- **Method**: `GET`
+- **Route**: `/health`
+- **Description**: ne depend pas de LND et ne requiert pas `API_KEY`. Renvoie l'etat de chaque noeud configure (`reachable`: `true`, `false` ou `null` si la verification est encore en cours).
+
+```bash
+curl -X GET http://localhost:5003/health
+```
+
 ### Lister les noeuds connectes
 
 - **Method**: `GET`
 - **Route**: `/api/nodes`
+- **Description**: liste les noeuds configures (`id`, `grpcHost`, `reachable`).
 - **Exemple curl**:
 
 ```bash
 curl -X GET http://localhost:5003/api/nodes
 ```
+
+> Toutes les routes `/api` exigent `x-api-key` (ou `Authorization: Bearer`) lorsque `API_KEY` est defini.
 
 ### Routes par noeud
 
@@ -273,11 +300,15 @@ curl -X POST http://localhost:5003/api/invoice \
 
 - **Method**: `GET`
 - **Route**: `/api/nodes/:nodeId/invoices` ou `/api/invoices` (legacy)
+- **Query (optionnel)**:
+  - `limit`: nombre de factures (entier entre 1 et 1000),
+  - `token`: curseur `next` renvoye par l'appel precedent, pour la pagination.
 - **Body**: aucun
+- **Reponse**: `{ nodeId, invoices, next }` (`next` vaut `null` quand il n'y a plus de page).
 - **Exemple curl**:
 
 ```bash
-curl -X GET http://localhost:5003/api/invoices
+curl -X GET "http://localhost:5003/api/invoices?limit=50"
 ```
 
 ### 6) Payer une facture BOLT11
@@ -339,6 +370,7 @@ curl -X POST http://localhost:5003/api/signmessage \
 ```
 
 - Les 3 champs sont obligatoires.
+- **Reponse**: `{ nodeId, isValid, signedBy }`. Le serveur compare `signedBy` (renvoye par LND) avec `pubkey`.
 - **Exemple curl**:
 
 ```bash
@@ -349,11 +381,15 @@ curl -X POST http://localhost:5003/api/verifymessage \
 
 ## Erreurs courantes
 
-- `404 Unknown LND node`: l'identifiant `:nodeId` ne correspond a aucun noeud connecte (consultez `GET /api/nodes`).
-- `503 LND service is unavailable`: la connexion LND n'est pas etablie (variables `.env` invalides ou noeud injoignable).
-- `400` sur les routes `POST`: payload JSON manquant ou invalide.
-- `500 Failed to get channels`: erreur LND lors de l'appel `getChannels` (macaroon, certificat, ou noeud injoignable).
-- `500`: erreur interne renvoyee par LND ou par le serveur.
+- `401 Invalid or missing API key`: `API_KEY` est defini mais la requete n'envoie pas la bonne cle.
+- `404 Unknown LND node "..."`: l'identifiant `:nodeId` ne correspond a aucun noeud connecte (consultez `GET /api/nodes`).
+- `404 Route not found`: l'URL n'existe pas.
+- `400 Invalid JSON body`: le corps de la requete n'est pas du JSON valide.
+- `400` sur les routes `POST`: payload manquant ou invalide (`sats` entier > 0, `request` BOLT11, `message`, etc.).
+- `413 Request body too large`: corps > 1 Mo.
+- `503 FailedToConnectToDaemon` (ou autre erreur `503`): LND est injoignable, ou les credentials `.env` sont invalides.
+- Les erreurs renvoyees par LND conservent leur code HTTP (`400`, `404`, `503`, ...). Les details internes ne sont plus exposes au client; consultez les logs du serveur.
+- `500 Internal server error`: erreur inattendue cote serveur.
 
 ## Scripts npm
 
